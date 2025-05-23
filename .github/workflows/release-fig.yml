@@ -36,5 +36,5 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           autocomplete-spec-name: mise
-          spec-path: tasks/fig/src/mise.ts
+          spec-path: xtasks/fig/src/mise.ts
           pr-body: "Automated PR for latest mise release by https://github.com/jdx/mise"
