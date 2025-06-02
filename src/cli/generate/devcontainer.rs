@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    config::SETTINGS,
+    config::Settings,
     file::{self, display_path},
     git::Git,
 };
@@ -53,8 +53,8 @@ struct DevcontainerMount {
 }
 
 impl Devcontainer {
-    pub fn run(self) -> eyre::Result<()> {
-        SETTINGS.ensure_experimental("generate devcontainer")?;
+    pub async fn run(self) -> eyre::Result<()> {
+        Settings::get().ensure_experimental("generate devcontainer")?;
         let output = self.generate()?;
 
         if self.write {

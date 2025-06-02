@@ -3,7 +3,6 @@ use crate::build_time::built_info;
 use crate::cache::CacheManagerBuilder;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
-use crate::config::settings::SETTINGS;
 use crate::config::{Config, Settings};
 use crate::file::{TarFormat, TarOptions};
 use crate::http::{HTTP, HTTP_FETCH};
@@ -11,48 +10,54 @@ use crate::install_context::InstallContext;
 use crate::toolset::ToolVersion;
 use crate::ui::progress_report::SingleReport;
 use crate::{env, file, gpg, hash, http, plugins};
+use async_trait::async_trait;
 use eyre::{Result, bail, ensure};
 use serde_derive::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
 use tempfile::tempdir_in;
+use tokio::sync::Mutex;
 use url::Url;
 use xx::regex;
 
 #[derive(Debug)]
 pub struct NodePlugin {
-    ba: BackendArg,
+    ba: Arc<BackendArg>,
 }
 
 impl NodePlugin {
     pub fn new() -> Self {
         Self {
-            ba: plugins::core::new_backend_arg("node"),
+            ba: plugins::core::new_backend_arg("node").into(),
         }
     }
 
-    fn install_precompiled(
+    async fn install_precompiled(
         &self,
         ctx: &InstallContext,
         tv: &mut ToolVersion,
         opts: &BuildOpts,
     ) -> Result<()> {
         let settings = Settings::get();
-        match self.fetch_tarball(
-            ctx,
-            tv,
-            &ctx.pr,
-            &opts.binary_tarball_url,
-            &opts.binary_tarball_path,
-            &opts.version,
-        ) {
+        match self
+            .fetch_tarball(
+                ctx,
+                tv,
+                &ctx.pr,
+                &opts.binary_tarball_url,
+                &opts.binary_tarball_path,
+                &opts.version,
+            )
+            .await
+        {
             Err(e)
                 if settings.node.compile != Some(false)
                     && matches!(http::error_code(&e), Some(404)) =>
             {
                 debug!("precompiled node not found");
-                return self.install_compiled(ctx, tv, opts);
+                return self.install_compiled(ctx, tv, opts).await;
             }
             e => e,
         }?;
@@ -71,20 +76,23 @@ impl NodePlugin {
         Ok(())
     }
 
-    fn install_windows(
+    async fn install_windows(
         &self,
         ctx: &InstallContext,
         tv: &mut ToolVersion,
         opts: &BuildOpts,
     ) -> Result<()> {
-        match self.fetch_tarball(
-            ctx,
-            tv,
-            &ctx.pr,
-            &opts.binary_tarball_url,
-            &opts.binary_tarball_path,
-            &opts.version,
-        ) {
+        match self
+            .fetch_tarball(
+                ctx,
+                tv,
+                &ctx.pr,
+                &opts.binary_tarball_url,
+                &opts.binary_tarball_path,
+                &opts.version,
+            )
+            .await
+        {
             Err(e) if matches!(http::error_code(&e), Some(404)) => {
                 bail!("precompiled node not found {e}");
             }
@@ -102,7 +110,7 @@ impl NodePlugin {
         Ok(())
     }
 
-    fn install_compiled(
+    async fn install_compiled(
         &self,
         ctx: &InstallContext,
         tv: &mut ToolVersion,
@@ -116,7 +124,8 @@ impl NodePlugin {
             &opts.source_tarball_url,
             &opts.source_tarball_path,
             &opts.version,
-        )?;
+        )
+        .await?;
         ctx.pr.set_message(format!("extract {tarball_name}"));
         file::remove_all(&opts.build_dir)?;
         file::untar(
@@ -134,7 +143,7 @@ impl NodePlugin {
         Ok(())
     }
 
-    fn fetch_tarball(
+    async fn fetch_tarball(
         &self,
         ctx: &InstallContext,
         tv: &mut ToolVersion,
@@ -148,11 +157,11 @@ impl NodePlugin {
             pr.set_message(format!("using previously downloaded {tarball_name}"));
         } else {
             pr.set_message(format!("download {tarball_name}"));
-            HTTP.download_file(url.clone(), local, Some(pr))?;
+            HTTP.download_file(url.clone(), local, Some(pr)).await?;
         }
         if *env::MISE_NODE_VERIFY && !tv.checksums.contains_key(&tarball_name) {
             tv.checksums
-                .insert(tarball_name, self.get_checksum(ctx, local, version)?);
+                .insert(tarball_name, self.get_checksum(ctx, local, version).await?);
         }
         self.verify_checksum(ctx, tv, local)?;
         Ok(())
@@ -180,12 +189,18 @@ impl NodePlugin {
         self.sh(ctx, opts)?.arg(&opts.make_install_cmd).execute()
     }
 
-    fn get_checksum(&self, ctx: &InstallContext, tarball: &Path, version: &str) -> Result<String> {
+    async fn get_checksum(
+        &self,
+        ctx: &InstallContext,
+        tarball: &Path,
+        version: &str,
+    ) -> Result<String> {
         let tarball_name = tarball.file_name().unwrap().to_string_lossy().to_string();
         let shasums_file = tarball.parent().unwrap().join("SHASUMS256.txt");
-        HTTP.download_file(self.shasums_url(version)?, &shasums_file, Some(&ctx.pr))?;
-        if SETTINGS.node.gpg_verify != Some(false) && version.starts_with("2") {
-            self.verify_with_gpg(ctx, &shasums_file, version)?;
+        HTTP.download_file(self.shasums_url(version)?, &shasums_file, Some(&ctx.pr))
+            .await?;
+        if Settings::get().node.gpg_verify != Some(false) && version.starts_with("2") {
+            self.verify_with_gpg(ctx, &shasums_file, version).await?;
         }
         let shasums = file::read_to_string(&shasums_file)?;
         let shasums = hash::parse_shasums(&shasums);
@@ -193,14 +208,19 @@ impl NodePlugin {
         Ok(format!("sha256:{shasum}"))
     }
 
-    fn verify_with_gpg(&self, ctx: &InstallContext, shasums_file: &Path, v: &str) -> Result<()> {
-        if file::which_non_pristine("gpg").is_none() && SETTINGS.node.gpg_verify.is_none() {
+    async fn verify_with_gpg(
+        &self,
+        ctx: &InstallContext,
+        shasums_file: &Path,
+        v: &str,
+    ) -> Result<()> {
+        if file::which_non_pristine("gpg").is_none() && Settings::get().node.gpg_verify.is_none() {
             warn!("gpg not found, skipping verification");
             return Ok(());
         }
         let sig_file = shasums_file.with_extension("asc");
         let sig_url = format!("{}.sig", self.shasums_url(v)?);
-        if let Err(e) = HTTP.download_file(sig_url, &sig_file, Some(&ctx.pr)) {
+        if let Err(e) = HTTP.download_file(sig_url, &sig_file, Some(&ctx.pr)).await {
             if matches!(http::error_code(&e), Some(404)) {
                 warn!("gpg signature not found, skipping verification");
                 return Ok(());
@@ -244,9 +264,9 @@ impl NodePlugin {
         }
     }
 
-    fn install_default_packages(
+    async fn install_default_packages(
         &self,
-        config: &Config,
+        config: &Arc<Config>,
         tv: &ToolVersion,
         pr: &Box<dyn SingleReport>,
     ) -> Result<()> {
@@ -263,7 +283,7 @@ impl NodePlugin {
                 .arg("install")
                 .arg("--global")
                 .arg(package)
-                .envs(config.env()?)
+                .envs(config.env().await?)
                 .env(&*env::PATH_KEY, plugins::core::path_env_with_tv_path(tv)?)
                 .execute()?;
         }
@@ -292,9 +312,9 @@ impl NodePlugin {
         Ok(())
     }
 
-    fn test_node(
+    async fn test_node(
         &self,
-        config: &Config,
+        config: &Arc<Config>,
         tv: &ToolVersion,
         pr: &Box<dyn SingleReport>,
     ) -> Result<()> {
@@ -302,13 +322,13 @@ impl NodePlugin {
         CmdLineRunner::new(self.node_path(tv))
             .with_pr(pr)
             .arg("-v")
-            .envs(config.env()?)
+            .envs(config.env().await?)
             .execute()
     }
 
-    fn test_npm(
+    async fn test_npm(
         &self,
-        config: &Config,
+        config: &Arc<Config>,
         tv: &ToolVersion,
         pr: &Box<dyn SingleReport>,
     ) -> Result<()> {
@@ -317,7 +337,7 @@ impl NodePlugin {
             .env(&*env::PATH_KEY, plugins::core::path_env_with_tv_path(tv)?)
             .with_pr(pr)
             .arg("-v")
-            .envs(config.env()?)
+            .envs(config.env().await?)
             .execute()
     }
 
@@ -332,21 +352,24 @@ impl NodePlugin {
     }
 }
 
+#[async_trait]
 impl Backend for NodePlugin {
-    fn ba(&self) -> &BackendArg {
+    fn ba(&self) -> &Arc<BackendArg> {
         &self.ba
     }
 
-    fn _list_remote_versions(&self) -> Result<Vec<String>> {
-        let base = SETTINGS.node.mirror_url();
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
+        let settings = Settings::get();
+        let base = Settings::get().node.mirror_url();
         let versions = HTTP_FETCH
-            .json::<Vec<NodeVersion>, _>(base.join("index.json")?)?
+            .json::<Vec<NodeVersion>, _>(base.join("index.json")?)
+            .await?
             .into_iter()
             .filter(|v| {
-                if let Some(flavor) = &SETTINGS.node.flavor {
+                if let Some(flavor) = &settings.node.flavor {
                     v.files
                         .iter()
-                        .any(|f| f == &format!("{}-{}-{}", os(), arch(), flavor))
+                        .any(|f| f == &format!("{}-{}-{}", os(), arch(&settings), flavor))
                 } else {
                     true
                 }
@@ -408,7 +431,7 @@ impl Backend for NodePlugin {
         Ok(body)
     }
 
-    fn install_version_(
+    async fn install_version_(
         &self,
         ctx: &InstallContext,
         mut tv: ToolVersion,
@@ -417,23 +440,25 @@ impl Backend for NodePlugin {
             tv.version != "latest",
             "version should not be 'latest' for node, something is wrong"
         );
-        let config = Config::get();
         let settings = Settings::get();
-        let opts = BuildOpts::new(ctx, &tv)?;
+        let opts = BuildOpts::new(ctx, &tv).await?;
         trace!("node build opts: {:#?}", opts);
         if cfg!(windows) {
-            self.install_windows(ctx, &mut tv, &opts)?;
+            self.install_windows(ctx, &mut tv, &opts).await?;
         } else if settings.node.compile == Some(true) {
-            self.install_compiled(ctx, &mut tv, &opts)?;
+            self.install_compiled(ctx, &mut tv, &opts).await?;
         } else {
-            self.install_precompiled(ctx, &mut tv, &opts)?;
+            self.install_precompiled(ctx, &mut tv, &opts).await?;
         }
-        self.test_node(&config, &tv, &ctx.pr)?;
+        self.test_node(&ctx.config, &tv, &ctx.pr).await?;
         if !cfg!(windows) {
             self.install_npm_shim(&tv)?;
         }
-        self.test_npm(&config, &tv, &ctx.pr)?;
-        if let Err(err) = self.install_default_packages(&config, &tv, &ctx.pr) {
+        self.test_npm(&ctx.config, &tv, &ctx.pr).await?;
+        if let Err(err) = self
+            .install_default_packages(&ctx.config, &tv, &ctx.pr)
+            .await
+        {
             warn!("failed to install default npm packages: {err:#}");
         }
         if *env::MISE_NODE_COREPACK && self.corepack_path(&tv).exists() {
@@ -444,7 +469,11 @@ impl Backend for NodePlugin {
     }
 
     #[cfg(windows)]
-    fn list_bin_paths(&self, tv: &ToolVersion) -> eyre::Result<Vec<PathBuf>> {
+    async fn list_bin_paths(
+        &self,
+        _config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> eyre::Result<Vec<PathBuf>> {
         Ok(vec![tv.install_path()])
     }
 
@@ -456,9 +485,9 @@ impl Backend for NodePlugin {
                     CacheManagerBuilder::new(
                         self.ba().cache_path.join("remote_versions.msgpack.z"),
                     )
-                    .with_fresh_duration(SETTINGS.fetch_remote_versions_cache())
-                    .with_cache_key(SETTINGS.node.mirror_url.clone().unwrap_or_default())
-                    .with_cache_key(SETTINGS.node.flavor.clone().unwrap_or_default())
+                    .with_fresh_duration(Settings::get().fetch_remote_versions_cache())
+                    .with_cache_key(Settings::get().node.mirror_url.clone().unwrap_or_default())
+                    .with_cache_key(Settings::get().node.flavor.clone().unwrap_or_default())
                     .build(),
                 )
                 .into()
@@ -485,7 +514,7 @@ struct BuildOpts {
 }
 
 impl BuildOpts {
-    fn new(ctx: &InstallContext, tv: &ToolVersion) -> Result<Self> {
+    async fn new(ctx: &InstallContext, tv: &ToolVersion) -> Result<Self> {
         let v = &tv.version;
         let install_path = tv.install_path();
         let source_tarball_name = format!("node-v{v}.tar.gz");
@@ -498,19 +527,19 @@ impl BuildOpts {
 
         Ok(Self {
             version: v.clone(),
-            path: ctx.ts.list_paths(),
+            path: ctx.ts.list_paths(&ctx.config).await,
             build_dir: env::MISE_TMP_DIR.join(format!("node-v{v}")),
             configure_cmd: configure_cmd(&install_path),
             make_cmd: make_cmd(),
             make_install_cmd: make_install_cmd(),
             source_tarball_path: tv.download_path().join(&source_tarball_name),
-            source_tarball_url: SETTINGS
+            source_tarball_url: Settings::get()
                 .node
                 .mirror_url()
                 .join(&format!("v{v}/{source_tarball_name}"))?,
             source_tarball_name,
             binary_tarball_path: tv.download_path().join(&binary_tarball_name),
-            binary_tarball_url: SETTINGS
+            binary_tarball_url: Settings::get()
                 .node
                 .mirror_url()
                 .join(&format!("v{v}/{binary_tarball_name}"))?,
@@ -562,8 +591,8 @@ fn os() -> &'static str {
     }
 }
 
-fn arch() -> &'static str {
-    let arch = SETTINGS.arch();
+fn arch(settings: &Settings) -> &str {
+    let arch = settings.arch();
     if arch == "x86" {
         "x86"
     } else if arch == "x86_64" {
@@ -586,10 +615,11 @@ fn arch() -> &'static str {
 }
 
 fn slug(v: &str) -> String {
-    if let Some(flavor) = &SETTINGS.node.flavor {
-        format!("node-v{v}-{}-{}-{flavor}", os(), arch())
+    let settings = Settings::get();
+    if let Some(flavor) = &settings.node.flavor {
+        format!("node-v{v}-{}-{}-{flavor}", os(), arch(&settings))
     } else {
-        format!("node-v{v}-{}-{}", os(), arch())
+        format!("node-v{v}-{}-{}", os(), arch(&settings))
     }
 }
 

@@ -1,8 +1,9 @@
+use std::sync::Arc;
+
 use crate::cli::args::ToolArg;
 use crate::config::Config;
 use crate::hooks::Hooks;
 use crate::toolset::{InstallOptions, ResolveOptions, ToolRequest, ToolSource, Toolset};
-use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::{config, env, hooks};
 use eyre::Result;
 use itertools::Itertools;
@@ -46,31 +47,54 @@ pub struct Install {
 }
 
 impl Install {
-    pub fn run(self) -> Result<()> {
-        let config = Config::try_get()?;
+    #[async_backtrace::framed]
+    pub async fn run(self) -> Result<()> {
+        let config = Config::get().await?;
         match &self.tool {
             Some(runtime) => {
+                let original_tool_args = env::TOOL_ARGS.read().unwrap().clone();
                 env::TOOL_ARGS.write().unwrap().clone_from(runtime);
-                self.install_runtimes(&config, runtime)?
+                self.install_runtimes(config, runtime, original_tool_args)
+                    .await?
             }
-            None => self.install_missing_runtimes(&config)?,
+            None => self.install_missing_runtimes(config).await?,
         };
         Ok(())
     }
 
-    fn install_runtimes(&self, config: &Config, runtimes: &[ToolArg]) -> Result<()> {
-        let mpr = MultiProgressReport::get();
+    #[async_backtrace::framed]
+    async fn install_runtimes(
+        &self,
+        mut config: Arc<Config>,
+        runtimes: &[ToolArg],
+        original_tool_args: Vec<ToolArg>,
+    ) -> Result<()> {
         let tools = runtimes.iter().map(|ta| ta.ba.short.clone()).collect();
-        let mut ts = config.get_tool_request_set()?.filter_by_tool(tools).into();
+        let mut ts = config
+            .get_tool_request_set()
+            .await?
+            .filter_by_tool(tools)
+            .into();
         let tool_versions = self.get_requested_tool_versions(&ts, runtimes)?;
-        let versions = if tool_versions.is_empty() {
+        let mut versions = if tool_versions.is_empty() {
             warn!("no runtimes to install");
             warn!("specify a version with `mise install <PLUGIN>@<VERSION>`");
             vec![]
         } else {
-            ts.install_all_versions(tool_versions, &mpr, &self.install_opts())?
+            ts.install_all_versions(&mut config, tool_versions, &self.install_opts())
+                .await?
         };
-        config::rebuild_shims_and_runtime_symlinks(&versions)?;
+        // because we may be installing a tool that is not in config, we need to restore the original tool args and reset everything
+        env::TOOL_ARGS
+            .write()
+            .unwrap()
+            .clone_from(&original_tool_args);
+        let config = Config::reset().await?;
+        let ts = config.get_toolset().await?;
+        let current_versions = ts.list_current_versions();
+        // ensure that only current versions are sent to lockfile rebuild
+        versions.retain(|tv| current_versions.iter().any(|(_, cv)| tv == cv));
+        config::rebuild_shims_and_runtime_symlinks(&config, ts, &versions).await?;
         Ok(())
     }
 
@@ -100,7 +124,7 @@ impl Install {
                 Some(tv) => requests.push(tv),
                 None => {
                     if ta.tvr.is_none() {
-                        match ts.versions.get(&ta.ba) {
+                        match ts.versions.get(ta.ba.as_ref()) {
                             // the tool is in config so fetch the params from config
                             // this may match multiple versions of one tool (e.g.: python)
                             Some(tvl) => {
@@ -127,19 +151,40 @@ impl Install {
         Ok(requests)
     }
 
-    fn install_missing_runtimes(&self, config: &Config) -> eyre::Result<()> {
-        let trs = config.get_tool_request_set()?;
-        let versions = trs.missing_tools().into_iter().cloned().collect_vec();
+    async fn install_missing_runtimes(&self, mut config: Arc<Config>) -> eyre::Result<()> {
+        let trs = measure!("get_tool_request_set", {
+            config.get_tool_request_set().await?
+        });
+        let versions = measure!("fetching missing runtims", {
+            trs.missing_tools(&config)
+                .await
+                .into_iter()
+                .cloned()
+                .collect_vec()
+        });
         let versions = if versions.is_empty() {
-            info!("all tools are installed");
-            hooks::run_one_hook(config.get_toolset()?, Hooks::Postinstall, None);
-            vec![]
+            measure!("run_postinstall_hook", {
+                info!("all tools are installed");
+                hooks::run_one_hook(
+                    &config,
+                    config.get_toolset().await?,
+                    Hooks::Postinstall,
+                    None,
+                )
+                .await;
+                vec![]
+            })
         } else {
-            let mpr = MultiProgressReport::get();
             let mut ts = Toolset::from(trs.clone());
-            ts.install_all_versions(versions, &mpr, &self.install_opts())?
+            measure!("install_all_versions", {
+                ts.install_all_versions(&mut config, versions, &self.install_opts())
+                    .await?
+            })
         };
-        config::rebuild_shims_and_runtime_symlinks(&versions)?;
+        measure!("rebuild_shims_and_runtime_symlinks", {
+            let ts = config.get_toolset().await?;
+            config::rebuild_shims_and_runtime_symlinks(&config, ts, &versions).await?;
+        });
         Ok(())
     }
 }

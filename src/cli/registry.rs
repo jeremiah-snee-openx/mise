@@ -1,5 +1,5 @@
 use crate::backend::backend_type::BackendType;
-use crate::config::SETTINGS;
+use crate::config::Settings;
 use crate::registry::{REGISTRY, RegistryTool, tool_enabled};
 use crate::ui::table::MiseTable;
 use eyre::{Result, bail};
@@ -30,7 +30,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         if let Some(name) = &self.name {
             if let Some(rt) = REGISTRY.get(name.as_str()) {
                 miseprintln!("{}", rt.backends().join(" "));
@@ -113,8 +113,8 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
 
 fn filter_enabled(short: &str) -> bool {
     tool_enabled(
-        &SETTINGS.enable_tools,
-        &SETTINGS.disable_tools,
+        &Settings::get().enable_tools,
+        &Settings::get().disable_tools,
         &short.to_string(),
     )
 }

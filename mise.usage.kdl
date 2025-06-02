@@ -143,7 +143,7 @@ cmd cache help="Manage the mise cache" {
 }
 cmd completion help="Generate shell completions" {
     alias complete completions hide=#true
-    after_long_help "Examples:\n\n    $ mise completion bash > ~/.local/share/bash-completion/mise\n    $ mise completion zsh  > /usr/local/share/zsh/site-functions/_mise\n    $ mise completion fish > ~/.config/fish/completions/mise.fish\n"
+    after_long_help "Examples:\n\n    $ mise completion bash > ~/.local/share/bash-completion/completions/mise\n    $ mise completion zsh  > /usr/local/share/zsh/site-functions/_mise\n    $ mise completion fish > ~/.config/fish/completions/mise.fish\n"
     flag "-s --shell" help="Shell type to generate completions for" hide=#true {
         arg <SHELL_TYPE> {
             choices bash fish zsh
@@ -513,6 +513,9 @@ cmd plugins help="Manage plugins" {
         flag "-f --force" help="Reinstall even if plugin exists"
         flag "-a --all" help="Install all missing plugins\nThis will only install plugins that have matching shorthands.\ni.e.: they don't need the full git repo url"
         flag "-v --verbose" help="Show installation output" var=#true count=#true
+        flag "-j --jobs" help="Number of jobs to run in parallel" {
+            arg <JOBS>
+        }
         arg "[NEW_PLUGIN]" help="The name of the plugin to install\ne.g.: node, ruby\nCan specify multiple plugins: `mise plugins install node ruby python`" required=#false
         arg "[GIT_URL]" help="The git url of the plugin" required=#false
         arg "[REST]…" required=#false var=#true hide=#true

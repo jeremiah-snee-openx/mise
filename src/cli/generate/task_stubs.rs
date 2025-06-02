@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::config::{Config, SETTINGS};
+use crate::config::{Config, Settings};
 use crate::file;
 use crate::task::Task;
 use clap::ValueHint;
@@ -25,10 +25,10 @@ pub struct TaskStubs {
 }
 
 impl TaskStubs {
-    pub fn run(self) -> Result<()> {
-        SETTINGS.ensure_experimental("generate task-stubs")?;
-        let config = Config::get();
-        for task in config.tasks()?.values() {
+    pub async fn run(self) -> eyre::Result<()> {
+        Settings::get().ensure_experimental("generate task-stubs")?;
+        let config = Config::get().await?;
+        for task in config.tasks().await?.values() {
             let bin = self.dir.join(task.name_to_path());
             let output = self.generate(task)?;
             if let Some(parent) = bin.parent() {
@@ -44,7 +44,7 @@ impl TaskStubs {
     fn generate(&self, task: &Task) -> Result<String> {
         let mise_bin = self.mise_bin.to_string_lossy();
         let mise_bin = shell_words::quote(&mise_bin);
-        let display_name = task.display_name();
+        let display_name = &task.display_name;
         let script = format!(
             r#"
 #!/bin/sh

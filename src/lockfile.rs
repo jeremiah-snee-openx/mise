@@ -1,15 +1,19 @@
-use crate::config::{Config, SETTINGS};
+use crate::config::{Config, Settings};
 use crate::file;
 use crate::file::display_path;
+use crate::path::PathExt;
 use crate::registry::{REGISTRY, tool_enabled};
 use crate::toolset::{ToolSource, ToolVersion, ToolVersionList, Toolset};
 use eyre::{Report, Result, bail};
 use itertools::Itertools;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 use std::sync::Mutex;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 use toml_edit::DocumentMut;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -29,7 +33,11 @@ pub struct LockfileTool {
 
 impl Lockfile {
     fn read<P: AsRef<Path>>(path: P) -> Result<Self> {
-        trace!("reading lockfile {}", display_path(&path));
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Lockfile::default());
+        }
+        trace!("reading lockfile {}", path.display_user());
         let content = file::read_to_string(path)?;
         let mut table: toml::Table = toml::from_str(&content)?;
         let tools: toml::Table = table
@@ -83,7 +91,7 @@ impl Lockfile {
 }
 
 pub fn update_lockfiles(config: &Config, ts: &Toolset, new_versions: &[ToolVersion]) -> Result<()> {
-    if !SETTINGS.lockfile || !SETTINGS.experimental {
+    if !Settings::get().lockfile || !Settings::get().experimental {
         return Ok(());
     }
     let mut all_tool_names = HashSet::new();
@@ -102,7 +110,7 @@ pub fn update_lockfiles(config: &Config, ts: &Toolset, new_versions: &[ToolVersi
     for (backend, group) in &new_versions.iter().chunk_by(|tv| tv.ba()) {
         let tvs = group.cloned().collect_vec();
         let source = tvs[0].request.source().clone();
-        let mut tvl = ToolVersionList::new(backend.clone(), source.clone());
+        let mut tvl = ToolVersionList::new(Arc::new(backend.clone()), source.clone());
         tvl.versions.extend(tvs);
         tools_by_source
             .entry(source)
@@ -140,7 +148,11 @@ pub fn update_lockfiles(config: &Config, ts: &Toolset, new_versions: &[ToolVersi
         // * tools inside a parent config but are overridden by a child config (we just keep what was in the lockfile before, if anything)
         existing_lockfile.tools.retain(|k, _| {
             all_tool_names.contains(k)
-                || !tool_enabled(&SETTINGS.enable_tools(), &SETTINGS.disable_tools(), k)
+                || !tool_enabled(
+                    &Settings::get().enable_tools(),
+                    &Settings::get().disable_tools(),
+                    k,
+                )
                 || REGISTRY
                     .get(&k.as_str())
                     .is_some_and(|rt| !rt.is_supported_os())
@@ -158,8 +170,8 @@ pub fn update_lockfiles(config: &Config, ts: &Toolset, new_versions: &[ToolVersi
     Ok(())
 }
 
-fn read_all_lockfiles() -> Lockfile {
-    Config::get()
+fn read_all_lockfiles(config: &Config) -> Lockfile {
+    config
         .config_files
         .iter()
         .rev()
@@ -192,11 +204,12 @@ fn read_lockfile_for(path: &Path) -> Result<Lockfile> {
 }
 
 pub fn get_locked_version(
+    config: &Config,
     path: Option<&Path>,
     short: &str,
     prefix: &str,
 ) -> Result<Option<LockfileTool>> {
-    if !SETTINGS.lockfile || !SETTINGS.experimental {
+    if !Settings::get().lockfile || !Settings::get().experimental {
         return Ok(None);
     }
 
@@ -210,7 +223,7 @@ pub fn get_locked_version(
         }
         None => {
             trace!("[{short}@{prefix}] reading all lockfiles");
-            read_all_lockfiles()
+            read_all_lockfiles(config)
         }
     };
 
@@ -227,14 +240,10 @@ pub fn get_locked_version(
 }
 
 fn handle_missing_lockfile(err: Report, lockfile_path: &Path) -> Lockfile {
-    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-        if io_err.kind() != std::io::ErrorKind::NotFound {
-            warn!(
-                "failed to read lockfile {}: {err:?}",
-                display_path(lockfile_path)
-            );
-        }
-    }
+    warn!(
+        "failed to read lockfile {}: {err:?}",
+        display_path(lockfile_path)
+    );
     Lockfile::default()
 }
 

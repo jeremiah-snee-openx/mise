@@ -18,7 +18,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
 use signal_hook::iterator::Signals;
 use std::sync::LazyLock as Lazy;
 
-use crate::config::SETTINGS;
+use crate::config::Settings;
 use crate::env;
 use crate::env::PATH_KEY;
 use crate::errors::Error::ScriptFailed;
@@ -104,8 +104,8 @@ pub struct CmdLineRunner<'a> {
     redactions: IndexSet<String>,
     raw: bool,
     pass_signals: bool,
-    on_stdout: Option<Box<dyn Fn(String) + 'a>>,
-    on_stderr: Option<Box<dyn Fn(String) + 'a>>,
+    on_stdout: Option<Box<dyn Fn(String) + Send + 'a>>,
+    on_stderr: Option<Box<dyn Fn(String) + Send + 'a>>,
 }
 
 static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
@@ -182,12 +182,12 @@ impl<'a> CmdLineRunner<'a> {
         self
     }
 
-    pub fn with_on_stdout<F: Fn(String) + 'a>(mut self, on_stdout: F) -> Self {
+    pub fn with_on_stdout<F: Fn(String) + Send + 'a>(mut self, on_stdout: F) -> Self {
         self.on_stdout = Some(Box::new(on_stdout));
         self
     }
 
-    pub fn with_on_stderr<F: Fn(String) + 'a>(mut self, on_stderr: F) -> Self {
+    pub fn with_on_stderr<F: Fn(String) + Send + 'a>(mut self, on_stderr: F) -> Self {
         self.on_stderr = Some(Box::new(on_stderr));
         self
     }
@@ -302,7 +302,7 @@ impl<'a> CmdLineRunner<'a> {
         static RAW_LOCK: RwLock<()> = RwLock::new(());
         let read_lock = RAW_LOCK.read().unwrap();
         debug!("$ {self}");
-        if SETTINGS.raw || self.raw {
+        if Settings::get().raw || self.raw {
             drop(read_lock);
             let _write_lock = RAW_LOCK.write().unwrap();
             return self.execute_raw();
@@ -468,7 +468,7 @@ impl<'a> CmdLineRunner<'a> {
         match self.pr.or(self.pr_arc.as_deref()) {
             Some(pr) => {
                 error!("{} failed", self.get_program());
-                if !SETTINGS.verbose && !output.trim().is_empty() {
+                if !Settings::get().verbose && !output.trim().is_empty() {
                     pr.println(output);
                 }
             }
@@ -518,10 +518,11 @@ enum ChildProcessOutput {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::cmd;
+    use crate::{cmd, config::Config};
 
-    #[test]
-    fn test_cmd() {
+    #[tokio::test]
+    async fn test_cmd() {
+        let _config = Config::get().await.unwrap();
         let output = cmd!("echo", "foo", "bar").read().unwrap();
         assert_eq!("foo bar", output);
     }

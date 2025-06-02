@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
 use std::io::prelude::*;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{collections::BTreeSet, sync::Arc};
 
 use base64::prelude::*;
 use eyre::Result;
@@ -45,6 +45,15 @@ impl From<&Path> for WatchFilePattern {
         Self {
             root: None,
             patterns: vec![path.to_string_lossy().to_string()],
+        }
+    }
+}
+
+impl From<PathBuf> for WatchFilePattern {
+    fn from(path: PathBuf) -> Self {
+        Self {
+            patterns: vec![path.to_string_lossy().to_string()],
+            root: Some(path),
         }
     }
 }
@@ -156,12 +165,12 @@ pub fn deserialize<T: serde::de::DeserializeOwned>(raw: String) -> Result<T> {
     Ok(rmp_serde::from_slice(&writer[..])?)
 }
 
-pub fn build_session(
+pub async fn build_session(
+    config: &Arc<Config>,
     env: EnvMap,
     loaded_tools: IndexSet<String>,
     watch_files: BTreeSet<WatchFilePattern>,
 ) -> Result<HookEnvSession> {
-    let config = Config::get();
     let mut max_modtime = UNIX_EPOCH;
     for cf in get_watch_files(watch_files)? {
         if let Ok(Ok(modified)) = cf.metadata().map(|m| m.modified()) {
@@ -169,7 +178,7 @@ pub fn build_session(
         }
     }
 
-    let config_paths = if let Ok(paths) = config.path_dirs() {
+    let config_paths = if let Ok(paths) = config.path_dirs().await {
         paths.iter().cloned().collect()
     } else {
         IndexSet::new()

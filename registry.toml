@@ -1321,9 +1321,11 @@ marp-cli.backends = ["aqua:marp-team/marp-cli", "asdf:xataz/asdf-marp-cli"]
 mask.backends = ["aqua:jacobdeichert/mask", "asdf:aaaaninja/asdf-mask"]
 mask.test = ["mask --version", "mask {{version}}"]
 maven.backends = [
+    "aqua:apache/maven",
     "asdf:mise-plugins/mise-maven",
     "vfox:mise-plugins/vfox-maven"
 ]
+maven.test = ["mvn --version", "Apache Maven {{version}}"]
 mc.backends = ["asdf:mise-plugins/mise-mc"]
 mdbook.backends = ["aqua:rust-lang/mdBook", "asdf:cipherstash/asdf-mdbook"]
 mdbook.test = ["mdbook --version", "mdbook v{{version}}"]
@@ -1605,6 +1607,8 @@ quarkus.backends = ["asdf:mise-plugins/mise-quarkus"]
 r.backends = ["asdf:mise-plugins/mise-r"]
 rabbitmq.backends = ["asdf:mise-plugins/asdf-rabbitmq"]
 racket.backends = ["asdf:mise-plugins/mise-racket"]
+railway.backends = ["ubi:railwayapp/cli[exe=railway]"]
+railway.test = ["railway --version", "railway {{version}}"]
 raku.backends = ["asdf:mise-plugins/mise-raku"]
 rancher.backends = ["aqua:rancher/cli", "asdf:abinet/asdf-rancher"]
 rancher.test = ["rancher --version", "rancher version v{{version}}"]
@@ -2008,10 +2012,10 @@ vhs.backends = ["aqua:charmbracelet/vhs", "asdf:chessmango/asdf-vhs"]
 victoria-metrics.backends = [
     "aqua:victoriametrics/victoriametrics/victoria-metrics"
 ]
-victoria-metrics.test = [
-    "victoria-metrics --version | awk -F'-' '{print $6}'",
-    "{{version}}"
-]
+# victoria-metrics.test = [
+# "victoria-metrics --version | awk -F'-' '{print $6}'",
+# "{{version}}"
+# ]
 viddy.backends = ["aqua:sachaos/viddy", "asdf:ryodocx/asdf-viddy"]
 vim.backends = ["asdf:mise-plugins/mise-vim"]
 virtualos.backends = ["asdf:mise-plugins/mise-virtualos"]

@@ -3,8 +3,11 @@ use std::path::PathBuf;
 use eyre::Result;
 use itertools::sorted;
 
-use crate::env::{NODENV_ROOT, NVM_DIR};
 use crate::{backend, cmd, config, dirs, file};
+use crate::{
+    config::Config,
+    env::{NODENV_ROOT, NVM_DIR},
+};
 
 /// Symlinks all tool versions from an external tool into mise
 ///
@@ -35,20 +38,23 @@ pub struct SyncNodeType {
 }
 
 impl SyncNode {
-    pub fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         if self._type.brew {
-            self.run_brew()?;
+            self.run_brew().await?;
         }
         if self._type.nvm {
-            self.run_nvm()?;
+            self.run_nvm().await?;
         }
         if self._type.nodenv {
-            self.run_nodenv()?;
+            self.run_nodenv().await?;
         }
+        let config = Config::reset().await?;
+        let ts = config.get_toolset().await?;
+        config::rebuild_shims_and_runtime_symlinks(&config, ts, &[]).await?;
         Ok(())
     }
 
-    fn run_brew(&self) -> Result<()> {
+    async fn run_brew(&self) -> Result<()> {
         let node = backend::get(&"node".into()).unwrap();
 
         let brew_prefix = PathBuf::from(cmd!("brew", "--prefix").read()?).join("opt");
@@ -69,11 +75,10 @@ impl SyncNode {
                 miseprintln!("Synced node@{} from Homebrew", v);
             }
         }
-
-        config::rebuild_shims_and_runtime_symlinks(&[])
+        Ok(())
     }
 
-    fn run_nvm(&self) -> Result<()> {
+    async fn run_nvm(&self) -> Result<()> {
         let node = backend::get(&"node".into()).unwrap();
 
         let nvm_versions_path = NVM_DIR.join("versions").join("node");
@@ -103,11 +108,10 @@ impl SyncNode {
         if !created.is_empty() {
             debug!("Created symlinks: {created:?}");
         }
-
-        config::rebuild_shims_and_runtime_symlinks(&[])
+        Ok(())
     }
 
-    fn run_nodenv(&self) -> Result<()> {
+    async fn run_nodenv(&self) -> Result<()> {
         let node = backend::get(&"node".into()).unwrap();
 
         let nodenv_versions_path = NODENV_ROOT.join("versions");
@@ -127,8 +131,7 @@ impl SyncNode {
                 miseprintln!("Synced node@{} from nodenv", v);
             }
         }
-
-        config::rebuild_shims_and_runtime_symlinks(&[])
+        Ok(())
     }
 }
 

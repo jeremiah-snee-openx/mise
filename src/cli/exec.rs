@@ -11,7 +11,7 @@ use eyre::{Result, eyre};
 use crate::cli::args::ToolArg;
 #[cfg(any(test, windows))]
 use crate::cmd;
-use crate::config::{Config, SETTINGS};
+use crate::config::{Config, Settings};
 use crate::env;
 use crate::toolset::{InstallOptions, ToolsetBuilder};
 
@@ -52,13 +52,15 @@ pub struct Exec {
 }
 
 impl Exec {
-    pub fn run(self) -> Result<()> {
-        let config = Config::get();
+    #[async_backtrace::framed]
+    pub async fn run(self) -> eyre::Result<()> {
+        let mut config = Config::get().await?;
         let mut ts = measure!("toolset", {
             ToolsetBuilder::new()
                 .with_args(&self.tool)
                 .with_default_to_latest(true)
-                .build(&config)?
+                .build(&config)
+                .await?
         });
         let opts = InstallOptions {
             force: false,
@@ -68,21 +70,21 @@ impl Exec {
             // also don't autoinstall if at least 1 tool is specified
             // in that case the user probably just wants that one tool
             missing_args_only: !self.tool.is_empty()
-                || !SETTINGS.exec_auto_install
+                || !Settings::get().exec_auto_install
                 || !console::user_attended_stderr()
                 || *env::__MISE_SHIM,
             resolve_options: Default::default(),
             ..Default::default()
         };
         measure!("install_arg_versions", {
-            ts.install_missing_versions(&opts)?
+            ts.install_missing_versions(&mut config, &opts).await?
         });
         measure!("notify_if_versions_missing", {
-            ts.notify_if_versions_missing()
+            ts.notify_if_versions_missing(&config).await;
         });
 
         let (program, mut args) = parse_command(&env::SHELL, &self.command, &self.c);
-        let env = measure!("env_with_path", { ts.env_with_path(&config)? });
+        let env = measure!("env_with_path", { ts.env_with_path(&config).await? });
 
         if program.rsplit('/').next() == Some("fish") {
             let mut cmd = vec![];
@@ -94,8 +96,8 @@ impl Exec {
                 ));
             }
             // TODO: env is being calculated twice with final_env and env_with_path
-            let (_, env_results) = ts.final_env(&config)?;
-            for p in ts.list_final_paths(&config, env_results)? {
+            let (_, env_results) = ts.final_env(&config).await?;
+            for p in ts.list_final_paths(&config, env_results).await? {
                 cmd.push(format!(
                     "fish_add_path -gm {}",
                     shell_escape::escape(p.to_string_lossy())
@@ -140,6 +142,12 @@ impl Exec {
         for (k, v) in env.iter() {
             cmd = cmd.env(k, v);
         }
+
+        // Windows does not support exec in the same way as Unix,
+        // so we emulate it instead by not handling Ctrl-C and letting
+        // the child process deal with it instead.
+        win_exec::set_ctrlc_handler()?;
+
         let res = cmd.unchecked().run()?;
         match res.status.code() {
             Some(0) => Ok(()),
@@ -164,6 +172,34 @@ impl Exec {
             Some(0) => Ok(()),
             Some(code) => Err(eyre!("command failed: exit code {}", code)),
             None => Err(eyre!("command failed: terminated by signal")),
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+mod win_exec {
+    use eyre::{Result, eyre};
+    use winapi::shared::minwindef::{BOOL, DWORD, FALSE, TRUE};
+    use winapi::um::consoleapi::SetConsoleCtrlHandler;
+    // Windows way of creating a process is to just go ahead and pop a new process
+    // with given program and args into existence. But in unix-land, it instead happens
+    // in a two-step process where you first fork the process and then exec the new program,
+    // essentially replacing the current process with the new one.
+    // We use Windows API to set a Ctrl-C handler that does nothing, essentially attempting
+    // to emulate the ctrl-c behavior by not handling it ourselves, and propagating it to
+    // the child process to handle it instead.
+    // This is the same way cargo does it in cargo run.
+    unsafe extern "system" fn ctrlc_handler(_: DWORD) -> BOOL {
+        // This is a no-op handler to prevent Ctrl-C from terminating the process.
+        // It allows the child process to handle Ctrl-C instead.
+        TRUE
+    }
+
+    pub(super) fn set_ctrlc_handler() -> Result<()> {
+        if unsafe { SetConsoleCtrlHandler(Some(ctrlc_handler), TRUE) } == FALSE {
+            Err(eyre!("Could not set Ctrl-C handler."))
+        } else {
+            Ok(())
         }
     }
 }

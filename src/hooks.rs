@@ -1,15 +1,16 @@
 use crate::cmd::cmd;
-use crate::config::{Config, SETTINGS, config_file};
+use crate::config::{Config, Settings, config_file};
 use crate::shell::Shell;
 use crate::toolset::Toolset;
 use crate::{dirs, hook_env};
 use eyre::{Result, eyre};
 use indexmap::IndexSet;
 use itertools::Itertools;
-use std::iter::once;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 use std::sync::Mutex;
+use std::{iter::once, sync::Arc};
+use tokio::sync::OnceCell;
 
 #[derive(
     Debug,
@@ -47,31 +48,44 @@ pub fn schedule_hook(hook: Hooks) {
     mu.insert(hook);
 }
 
-pub fn run_all_hooks(ts: &Toolset, shell: &dyn Shell) {
-    let mut mu = SCHEDULED_HOOKS.lock().unwrap();
-    for hook in mu.drain(..) {
-        run_one_hook(ts, hook, Some(shell));
+pub async fn run_all_hooks(config: &Arc<Config>, ts: &Toolset, shell: &dyn Shell) {
+    let hooks = {
+        let mut mu = SCHEDULED_HOOKS.lock().unwrap();
+        mu.drain(..).collect::<Vec<_>>()
+    };
+    for hook in hooks {
+        run_one_hook(config, ts, hook, Some(shell)).await;
     }
 }
 
-static ALL_HOOKS: Lazy<Vec<(PathBuf, Hook)>> = Lazy::new(|| {
-    let config = Config::get();
-    let mut hooks = config.hooks().cloned().unwrap_or_default();
-    let cur_configs = config.config_files.keys().cloned().collect::<IndexSet<_>>();
-    let prev_configs = &hook_env::PREV_SESSION.loaded_configs;
-    let old_configs = prev_configs.difference(&cur_configs);
-    for p in old_configs {
-        if let Ok(cf) = config_file::parse(p) {
-            if let Ok(h) = cf.hooks() {
-                hooks.extend(h.into_iter().map(|h| (cf.config_root(), h)));
+async fn all_hooks(config: &Arc<Config>) -> &'static Vec<(PathBuf, Hook)> {
+    static ALL_HOOKS: OnceCell<Vec<(PathBuf, Hook)>> = OnceCell::const_new();
+    ALL_HOOKS
+        .get_or_init(async || {
+            let mut hooks = config.hooks().await.cloned().unwrap_or_default();
+            let cur_configs = config.config_files.keys().cloned().collect::<IndexSet<_>>();
+            let prev_configs = &hook_env::PREV_SESSION.loaded_configs;
+            let old_configs = prev_configs.difference(&cur_configs);
+            for p in old_configs {
+                if let Ok(cf) = config_file::parse(p) {
+                    if let Ok(h) = cf.hooks() {
+                        hooks.extend(h.into_iter().map(|h| (cf.config_root(), h)));
+                    }
+                }
             }
-        }
-    }
-    hooks
-});
+            hooks
+        })
+        .await
+}
 
-pub fn run_one_hook(ts: &Toolset, hook: Hooks, shell: Option<&dyn Shell>) {
-    for (root, h) in &*ALL_HOOKS {
+#[async_backtrace::framed]
+pub async fn run_one_hook(
+    config: &Arc<Config>,
+    ts: &Toolset,
+    hook: Hooks,
+    shell: Option<&dyn Shell>,
+) {
+    for (root, h) in all_hooks(config).await {
         if hook != h.hook || (h.shell.is_some() && h.shell != shell.map(|s| s.to_string())) {
             continue;
         }
@@ -102,7 +116,7 @@ pub fn run_one_hook(ts: &Toolset, hook: Hooks, shell: Option<&dyn Shell>) {
         }
         if h.shell.is_some() {
             println!("{}", h.script);
-        } else if let Err(e) = execute(ts, root, h) {
+        } else if let Err(e) = execute(config, ts, root, h).await {
             warn!("error executing hook: {e}");
         }
     }
@@ -145,9 +159,9 @@ impl Hook {
     }
 }
 
-fn execute(ts: &Toolset, root: &Path, hook: &Hook) -> Result<()> {
-    SETTINGS.ensure_experimental("hooks")?;
-    let shell = SETTINGS.default_inline_shell()?;
+async fn execute(config: &Arc<Config>, ts: &Toolset, root: &Path, hook: &Hook) -> Result<()> {
+    Settings::get().ensure_experimental("hooks")?;
+    let shell = Settings::get().default_inline_shell()?;
 
     let args = shell
         .iter()
@@ -155,8 +169,7 @@ fn execute(ts: &Toolset, root: &Path, hook: &Hook) -> Result<()> {
         .map(|s| s.as_str())
         .chain(once(hook.script.as_str()))
         .collect_vec();
-    let config = Config::get();
-    let mut env = ts.full_env(&config)?;
+    let mut env = ts.full_env(config).await?;
     if let Some(cwd) = dirs::CWD.as_ref() {
         env.insert(
             "MISE_ORIGINAL_CWD".to_string(),

@@ -1,39 +1,42 @@
-use crate::{env, timeout};
+use crate::{env, plugins::PluginEnum, timeout};
+use async_trait::async_trait;
 use heck::ToKebabCase;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::Arc;
 use std::thread;
+use tokio::sync::RwLock;
 
 use crate::backend::Backend;
 use crate::backend::backend_type::BackendType;
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
-use crate::config::{Config, SETTINGS};
+use crate::config::{Config, Settings};
 use crate::dirs;
 use crate::env_diff::EnvMap;
 use crate::install_context::InstallContext;
 use crate::plugins::vfox_plugin::VfoxPlugin;
 use crate::plugins::{Plugin, PluginType};
-use crate::tokio::RUNTIME;
 use crate::toolset::{ToolVersion, Toolset};
 use crate::ui::multi_progress_report::MultiProgressReport;
 
 #[derive(Debug)]
 pub struct VfoxBackend {
-    ba: BackendArg,
-    plugin: Box<VfoxPlugin>,
+    ba: Arc<BackendArg>,
+    plugin: Arc<VfoxPlugin>,
+    plugin_enum: PluginEnum,
     exec_env_cache: RwLock<HashMap<String, CacheManager<EnvMap>>>,
     pathname: String,
 }
 
+#[async_trait]
 impl Backend for VfoxBackend {
     fn get_type(&self) -> BackendType {
         BackendType::Vfox
     }
 
-    fn ba(&self) -> &BackendArg {
+    fn ba(&self) -> &Arc<BackendArg> {
         &self.ba
     }
 
@@ -41,28 +44,30 @@ impl Backend for VfoxBackend {
         Some(PluginType::Vfox)
     }
 
-    fn _list_remote_versions(&self) -> eyre::Result<Vec<String>> {
-        timeout::run_with_timeout(
-            || {
-                let (vfox, _log_rx) = self.plugin.vfox();
-                self.ensure_plugin_installed()?;
-                let versions = RUNTIME.block_on(vfox.list_available_versions(&self.pathname))?;
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+        let this = self;
+        timeout::run_with_timeout_async(
+            || async {
+                let (vfox, _log_rx) = this.plugin.vfox();
+                this.ensure_plugin_installed(config).await?;
+                let versions = vfox.list_available_versions(&this.pathname).await?;
                 Ok(versions
                     .into_iter()
                     .rev()
                     .map(|v| v.version)
                     .collect::<Vec<String>>())
             },
-            SETTINGS.fetch_remote_versions_timeout(),
+            Settings::get().fetch_remote_versions_timeout(),
         )
+        .await
     }
 
-    fn install_version_(
+    async fn install_version_(
         &self,
-        _ctx: &InstallContext,
+        ctx: &InstallContext,
         tv: ToolVersion,
     ) -> eyre::Result<ToolVersion> {
-        self.ensure_plugin_installed()?;
+        self.ensure_plugin_installed(&ctx.config).await?;
         let (vfox, log_rx) = self.plugin.vfox();
         thread::spawn(|| {
             for line in log_rx {
@@ -70,13 +75,19 @@ impl Backend for VfoxBackend {
                 info!("{}", line);
             }
         });
-        RUNTIME.block_on(vfox.install(&self.pathname, &tv.version, tv.install_path()))?;
+        vfox.install(&self.pathname, &tv.version, tv.install_path())
+            .await?;
         Ok(tv)
     }
 
-    fn list_bin_paths(&self, tv: &ToolVersion) -> eyre::Result<Vec<PathBuf>> {
+    async fn list_bin_paths(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> eyre::Result<Vec<PathBuf>> {
         let path = self
-            ._exec_env(tv)?
+            ._exec_env(config, tv)
+            .await?
             .iter()
             .find(|(k, _)| k.to_uppercase() == "PATH")
             .map(|(_, v)| v.to_string())
@@ -84,16 +95,22 @@ impl Backend for VfoxBackend {
         Ok(env::split_paths(&path).collect())
     }
 
-    fn exec_env(&self, _config: &Config, _ts: &Toolset, tv: &ToolVersion) -> eyre::Result<EnvMap> {
+    async fn exec_env(
+        &self,
+        config: &Arc<Config>,
+        _ts: &Toolset,
+        tv: &ToolVersion,
+    ) -> eyre::Result<EnvMap> {
         Ok(self
-            ._exec_env(tv)?
+            ._exec_env(config, tv)
+            .await?
             .into_iter()
             .filter(|(k, _)| k.to_uppercase() != "PATH")
             .collect())
     }
 
-    fn plugin(&self) -> Option<&dyn Plugin> {
-        Some(&*self.plugin)
+    fn plugin(&self) -> Option<&PluginEnum> {
+        Some(&self.plugin_enum)
     }
 }
 
@@ -103,18 +120,24 @@ impl VfoxBackend {
         let plugin_path = dirs::PLUGINS.join(&pathname);
         let mut plugin = VfoxPlugin::new(pathname.clone(), plugin_path.clone());
         plugin.full = Some(ba.full());
+        let plugin = Arc::new(plugin);
         Self {
             exec_env_cache: Default::default(),
-            plugin: Box::new(plugin),
-            ba,
+            plugin: plugin.clone(),
+            plugin_enum: PluginEnum::Vfox(plugin),
+            ba: Arc::new(ba),
             pathname,
         }
     }
 
-    fn _exec_env(&self, tv: &ToolVersion) -> eyre::Result<BTreeMap<String, String>> {
+    async fn _exec_env(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> eyre::Result<BTreeMap<String, String>> {
         let key = tv.to_string();
-        if !self.exec_env_cache.read().unwrap().contains_key(&key) {
-            let mut caches = self.exec_env_cache.write().unwrap();
+        if !self.exec_env_cache.read().await.contains_key(&key) {
+            let mut caches = self.exec_env_cache.write().await;
             caches.insert(
                 key.clone(),
                 CacheManagerBuilder::new(tv.cache_path().join("exec_env.msgpack.z"))
@@ -124,14 +147,15 @@ impl VfoxBackend {
                     .build(),
             );
         }
-        let exec_env_cache = self.exec_env_cache.read().unwrap();
+        let exec_env_cache = self.exec_env_cache.read().await;
         let cache = exec_env_cache.get(&key).unwrap();
         cache
-            .get_or_try_init(|| {
-                self.ensure_plugin_installed()?;
+            .get_or_try_init_async(async || {
+                self.ensure_plugin_installed(config).await?;
                 let (vfox, _log_rx) = self.plugin.vfox();
-                Ok(RUNTIME
-                    .block_on(vfox.env_keys(&self.pathname, &tv.version))?
+                Ok(vfox
+                    .env_keys(&self.pathname, &tv.version)
+                    .await?
                     .into_iter()
                     .fold(BTreeMap::new(), |mut acc, env_key| {
                         let key = &env_key.key;
@@ -151,11 +175,13 @@ impl VfoxBackend {
                         acc
                     }))
             })
+            .await
             .cloned()
     }
 
-    fn ensure_plugin_installed(&self) -> eyre::Result<()> {
+    async fn ensure_plugin_installed(&self, config: &Arc<Config>) -> eyre::Result<()> {
         self.plugin
-            .ensure_installed(&MultiProgressReport::get(), false)
+            .ensure_installed(config, &MultiProgressReport::get(), false)
+            .await
     }
 }

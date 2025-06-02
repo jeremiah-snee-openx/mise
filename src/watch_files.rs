@@ -1,15 +1,14 @@
 use crate::cmd::cmd;
-use crate::config::{Config, SETTINGS};
+use crate::config::{Config, Settings};
 use crate::dirs;
 use crate::toolset::Toolset;
 use eyre::Result;
 use globset::{GlobBuilder, GlobSetBuilder};
 use itertools::Itertools;
-use rayon::prelude::*;
-use std::collections::BTreeSet;
 use std::iter::once;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(
     Debug, Clone, serde::Serialize, serde::Deserialize, Ord, PartialOrd, Eq, PartialEq, Hash,
@@ -27,19 +26,21 @@ pub fn add_modified_file(file: PathBuf) {
     set.insert(file);
 }
 
-pub fn execute_runs(ts: &Toolset) {
-    let mut mu = MODIFIED_FILES.lock().unwrap();
-    let files = mu.take().unwrap_or_default();
+pub async fn execute_runs(config: &Arc<Config>, ts: &Toolset) {
+    let files = {
+        let mut mu = MODIFIED_FILES.lock().unwrap();
+        mu.take().unwrap_or_default()
+    };
     if files.is_empty() {
         return;
     }
-    for (root, wf) in Config::get().watch_file_hooks().unwrap_or_default() {
+    for (root, wf) in config.watch_file_hooks().unwrap_or_default() {
         match has_matching_files(&root, &wf, &files) {
             Ok(files) if files.is_empty() => {
                 continue;
             }
             Ok(files) => {
-                if let Err(e) = execute(ts, &root, &wf.run, files) {
+                if let Err(e) = execute(config, ts, &root, &wf.run, files).await {
                     warn!("error executing watch_file hook: {e}");
                 }
             }
@@ -50,13 +51,19 @@ pub fn execute_runs(ts: &Toolset) {
     }
 }
 
-fn execute(ts: &Toolset, root: &Path, run: &str, files: Vec<&PathBuf>) -> Result<()> {
-    SETTINGS.ensure_experimental("watch_file_hooks")?;
+async fn execute(
+    config: &Arc<Config>,
+    ts: &Toolset,
+    root: &Path,
+    run: &str,
+    files: Vec<&PathBuf>,
+) -> Result<()> {
+    Settings::get().ensure_experimental("watch_file_hooks")?;
     let modified_files_var = files
         .iter()
         .map(|f| f.to_string_lossy().replace(':', "\\:"))
         .join(":");
-    let shell = SETTINGS.default_inline_shell()?;
+    let shell = Settings::get().default_inline_shell()?;
 
     let args = shell
         .iter()
@@ -64,8 +71,7 @@ fn execute(ts: &Toolset, root: &Path, run: &str, files: Vec<&PathBuf>) -> Result
         .map(|s| s.as_str())
         .chain(once(run))
         .collect_vec();
-    let config = Config::get();
-    let mut env = ts.full_env(&config)?;
+    let mut env = ts.full_env(config).await?;
     env.insert("MISE_WATCH_FILES_MODIFIED".to_string(), modified_files_var);
     if let Some(cwd) = &*dirs::CWD {
         env.insert(
@@ -125,7 +131,7 @@ pub fn glob(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
         ..Default::default()
     };
     Ok(patterns
-        .par_iter()
+        .iter()
         .map(|pattern| root.join(pattern).to_string_lossy().to_string())
         .filter_map(|pattern| glob::glob_with(&pattern, opts).ok())
         .collect::<Vec<_>>()
